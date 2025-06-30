@@ -45,7 +45,7 @@ const int ADCSIZE = 45;
 const double PEAK_POSITION_RMS_CUT = 2.5;
 const double AREA_HEIGHT_RATIO_CUT = 1.2;
 const int SATURATION_THRESHOLD_LOW = 10;     // Raw ADC < 10 indicates saturation
-const int SATURATION_THRESHOLD_HIGH = 4085;  // Raw ADC > 4085 indicates saturation
+const int SATURATION_THRESHOLD_HIGH = 3800;  // Raw ADC > 4085 indicates saturation
 
 // Generate unique output directory with timestamp
 string getTimestamp() {
