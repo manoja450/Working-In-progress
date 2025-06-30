@@ -45,7 +45,24 @@ const int ADCSIZE = 45;
 const double PEAK_POSITION_RMS_CUT = 2.5;
 const double AREA_HEIGHT_RATIO_CUT = 1.2;
 const int SATURATION_THRESHOLD_LOW = 10;     // Raw ADC < 10 indicates saturation
-const int SATURATION_THRESHOLD_HIGH = 3800;  // Raw ADC > 4085 indicates saturation
+const int SATURATION_THRESHOLD_HIGH = 3500;  // Raw ADC > 4085 indicates saturation
+
+// Combined veto thresholds: first 8 for side panels, last 2 for top panels
+const std::vector<double> VETO_THRESHOLDS = {
+    750,   // Side VP 0 (channel 12)
+    950,   // Side VP 1 (channel 13)
+    1200,  // Side VP 2 (channel 14)
+    1375,  // Side VP 3 (channel 15)
+    525,   // Side VP 4 (channel 16)
+    700,   // Side VP 5 (channel 17)
+    700,   // Side VP 6 (channel 18)
+    500,   // Side VP 7 (channel 19)
+    450,   // Top VP 0 (channel 20)
+    450    // Top VP 1 (channel 21)
+};
+
+const double FIT_MIN = 1.0;
+const double FIT_MAX = 10.0;
 
 // Generate unique output directory with timestamp
 string getTimestamp() {
@@ -57,11 +74,6 @@ string getTimestamp() {
     return string(buffer);
 }
 string OUTPUT_DIR = "./AnalysisOutput_" + getTimestamp();
-
-const std::vector<double> SIDE_VP_THRESHOLDS = {750, 950, 1200, 1375, 525, 700, 700, 500};
-const double TOP_VP_THRESHOLD = 450;
-const double FIT_MIN = 1.0;
-const double FIT_MAX = 10.0;
 
 // Pulse structures with proper initialization
 struct pulse_temp {
@@ -439,6 +451,11 @@ int main(int argc, char *argv[]) {
     h_saturation->GetXaxis()->SetBinLabel(1, "Saturated");
     h_saturation->GetXaxis()->SetBinLabel(2, "Not Saturated");
 
+    // Global time tracking for cross-file associations
+    double last_muon_time = -1000.0;  // Initialize to negative value
+    std::map<double, double> global_muons;  // Track muons globally: time -> energy
+    std::set<double> global_muon_times_with_michel;  // Track Michel-associated muons
+
     for (const auto& inputFileName : inputFiles) {
         // Per-file statistics
         int file_events = 0;
@@ -489,7 +506,6 @@ int main(int argc, char *argv[]) {
 
         int numEntries = t->GetEntries();
         cout << "Processing " << numEntries << " entries in " << inputFileName << endl;
-        double last_muon_time = 0.0;
         std::set<double> michel_muon_times;
         std::vector<std::pair<double, double>> muon_candidates;
 
@@ -698,20 +714,20 @@ int main(int argc, char *argv[]) {
                 file_good_events++;
                 total_good_events++;
 
-                // Muon detection
+                // Muon detection using unified veto thresholds
                 bool veto_hit = false;
-                for (size_t i = 0; i < SIDE_VP_THRESHOLDS.size(); i++) {
-                    if (veto_energies[i] > SIDE_VP_THRESHOLDS[i]) {
+                for (int i = 0; i < 10; i++) {
+                    if (veto_energies[i] > VETO_THRESHOLDS[i]) {
                         veto_hit = true;
                         break;
                     }
                 }
-                if (!veto_hit && p.top_vp_energy > TOP_VP_THRESHOLD) veto_hit = true;
 
                 if ((p.energy > MUON_ENERGY_THRESHOLD && veto_hit) ||
                     (pulse_at_end && p.energy > MUON_ENERGY_THRESHOLD / 2 && veto_hit)) {
                     p.is_muon = true;
                     last_muon_time = p.start;
+                    global_muons[p.start] = p.energy;  // Store globally
                     file_muons++;
                     total_muons++;
                     muon_candidates.emplace_back(p.start, p.energy);
@@ -719,17 +735,14 @@ int main(int argc, char *argv[]) {
                     h_top_vp_muon->Fill(p.top_vp_energy);
                 }
 
-                // Michel electron detection
+                // Michel electron detection using unified veto thresholds
                 double dt = p.start - last_muon_time;
                 bool veto_low = true;
-                for (size_t i = 0; i < SIDE_VP_THRESHOLDS.size(); i++) {
-                    if (veto_energies[i] > SIDE_VP_THRESHOLDS[i]) {
+                for (int i = 0; i < 10; i++) {
+                    if (veto_energies[i] > VETO_THRESHOLDS[i]) {
                         veto_low = false;
                         break;
                     }
-                }
-                if (veto_energies[8] > TOP_VP_THRESHOLD || veto_energies[9] > TOP_VP_THRESHOLD) {
-                    veto_low = false;
                 }
 
                 // Define common Michel electron criteria
@@ -752,6 +765,7 @@ int main(int argc, char *argv[]) {
                     file_michels++;
                     total_michels++;
                     michel_muon_times.insert(last_muon_time);
+                    global_muon_times_with_michel.insert(last_muon_time);  // Store globally
                     h_michel_energy->Fill(p.energy);
                 }
 
@@ -764,13 +778,6 @@ int main(int argc, char *argv[]) {
             p.last_muon_time = last_muon_time;
         }
 
-        // Second pass: Fill h_muon_energy for muons associated with Michel electrons
-        for (const auto& muon : muon_candidates) {
-            if (michel_muon_times.find(muon.first) != michel_muon_times.end()) {
-                h_muon_energy->Fill(muon.second);
-            }
-        }
-
         // Print stats to console
         cout << "File " << inputFileName << " Statistics:\n";
         cout << "Total Events: " << file_events << "\n";
@@ -781,6 +788,13 @@ int main(int argc, char *argv[]) {
         cout << "------------------------\n";
 
         f->Close();
+    }
+
+    // Fill muon energy histogram for muons associated with Michel electrons
+    for (const auto& muon : global_muons) {
+        if (global_muon_times_with_michel.find(muon.first) != global_muon_times_with_michel.end()) {
+            h_muon_energy->Fill(muon.second);
+        }
     }
 
     // Print triggerBits distribution
