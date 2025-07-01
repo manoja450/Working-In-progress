@@ -39,7 +39,7 @@ const int EV61_THRESHOLD = 1200;
 const double MUON_ENERGY_THRESHOLD = 50;
 const double MICHEL_ENERGY_MIN = 40;
 const double MICHEL_ENERGY_MAX = 1000;
-const double MICHEL_ENERGY_MAX_DT = 400;
+const double MICHEL_ENERGY_MAX_DT = 500;
 const double MICHEL_DT_MIN = 0.8;
 const double MICHEL_DT_MAX = 16.0;
 const int ADCSIZE = 45;
@@ -412,19 +412,18 @@ void CreateStatsBox(TH1* hist, TF1* fitFunc = nullptr,
     // Add histogram statistics
     stats->AddText(Form("Entries = %d", (int)hist->GetEntries()));
     stats->AddText(Form("Mean = %.3f #mus", hist->GetMean()));
-    stats->AddText(Form("StdDev = %.3f #mus", hist->GetRMS()));
+    stats->AddText(Form("Std Dev = %.3f #mus", hist->GetRMS()));
     
     // Add fit results if available
     if (fitFunc) {
         stats->AddText(Form("#chi^{2}/NDF = %.4f", 
                            fitFunc->GetChisquare() / fitFunc->GetNDF()));
-         stats->AddText(Form("N_{0} = %.1f #pm %.1f", 
+        stats->AddText(Form("N_{0} = %.1f #pm %.1f", 
                            fitFunc->GetParameter(0), 
-                           fitFunc->GetParError(0)));                  
-        stats->AddText(Form("#tau = %.4f #pm %.4f #mus", 
+                           fitFunc->GetParError(0)));
+       stats->AddText(Form("#tau = %.4f #pm %.4f #mus", 
                            fitFunc->GetParameter(1), 
-                           fitFunc->GetParError(1)));
-        
+                           fitFunc->GetParError(1)));                    
     }
     
     // Add to histogram and draw
@@ -496,8 +495,9 @@ int main(int argc, char *argv[]) {
     // Define histograms
     TH1D* h_muon_energy = new TH1D("muon_energy", "Muon Energy Distribution (with Michel Electrons);Energy (p.e.);Counts/100 p.e.", 550, -500, 5000);
     TH1D* h_michel_energy = new TH1D("michel_energy", "Michel Electron Energy Distribution;Energy (p.e.);Counts/4 p.e.", 200, 0, 800);
-    TH1D* h_dt_michel = new TH1D("DeltaT", "Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
-    TH1D* h_dt_michel_filtered = new TH1D("DeltaT_filtered", "Filtered Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
+    TH1D* h_michel_energy_filtered = new TH1D("michel_energyFiltered", "Michel Electron Energy Distribution;Energy (p.e.);Counts/4 p.e.", 200, 0, 800);
+    TH1D* h_dt_michel = new TH1D("DeltaTInital", "Initial Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
+    TH1D* h_dt_michel_filtered = new TH1D("DeltaT", "Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
     TH2D* h_energy_vs_dt = new TH2D("energy_vs_dt", "Michel Energy vs Time Difference;dt (#mus);Energy (p.e.)", 160, 0, 1000, 200, 0, 2000);
     TH1D* h_side_vp_muon = new TH1D("side_vp_muon", "Side Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 5000);
     TH1D* h_top_vp_muon = new TH1D("top_vp_muon", "Top Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 1000);
@@ -846,6 +846,11 @@ int main(int argc, char *argv[]) {
                     h_dt_michel->Fill(dt);
                     h_energy_vs_dt->Fill(dt, p.energy);
                     
+                    // Fill filtered energy spectrum if in good time window
+                    if (dt >= MICHEL_DT_MIN && dt <= MICHEL_DT_MAX) {
+                        h_michel_energy_filtered->Fill(p.energy);
+                    }
+                    
                     if ((dt >= REGION1_LOW && dt <= REGION1_HIGH) || 
                         (dt >= REGION2_LOW && dt <= REGION2_HIGH)) {
                         h_special_regions->Fill(dt);
@@ -881,10 +886,12 @@ int main(int argc, char *argv[]) {
 
     // Fill h_dt_michel_filtered with events from 0.8-16 µs
     h_dt_michel_filtered->Reset();
+    h_michel_energy_filtered->Reset();  // Reset the filtered energy spectrum too
     std::ofstream logFile((OUTPUT_DIR + "/excluded_events.txt").c_str());
     for (const auto& candidate : michel_candidates) {
         if (candidate.dt >= MICHEL_DT_MIN && candidate.dt <= MICHEL_DT_MAX) {
             h_dt_michel_filtered->Fill(candidate.dt);
+            h_michel_energy_filtered->Fill(candidate.energy);  // Fill filtered energy
         } else {
             logFile << "Excluded (outside plotting range): File = " << candidate.fileName 
                     << ", EventID = " << candidate.eventID 
@@ -1066,9 +1073,11 @@ int main(int argc, char *argv[]) {
 
         // Refill histogram with remaining events
         h_dt_michel_filtered->Reset();
+        h_michel_energy_filtered->Reset();  // Reset the filtered energy spectrum too
         for (const auto& candidate : filtered_candidates) {
             if (candidate.dt >= MICHEL_DT_MIN && candidate.dt <= MICHEL_DT_MAX) {
                 h_dt_michel_filtered->Fill(candidate.dt);
+                h_michel_energy_filtered->Fill(candidate.energy);  // Fill filtered energy
             }
         }
         
@@ -1111,6 +1120,17 @@ int main(int argc, char *argv[]) {
     CreateStatsBox(h_michel_energy, nullptr, "Michel Energy", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Michel_Energy.png";
+    c->SaveAs(plotName.c_str());
+    cout << "Saved plot: " << plotName << endl;
+
+    // Filtered Michel Energy
+    c->Clear();
+    h_michel_energy_filtered->SetLineColor(kRed);
+    h_michel_energy_filtered->SetLineWidth(2);
+    h_michel_energy_filtered->Draw();
+    CreateStatsBox(h_michel_energy_filtered, nullptr, "Filtered Michel Energy", kRed);
+    c->Update();
+    plotName = OUTPUT_DIR + "/Michel_Energy_filtered.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
@@ -1248,7 +1268,7 @@ int main(int argc, char *argv[]) {
         expFit->Draw("same");
 
         // Create the stats box with fit parameters
-        CreateStatsBox(h_dt_michel_filtered, expFit, "Filtered DeltaT", kRed);
+        CreateStatsBox(h_dt_michel_filtered, expFit, " DeltaT", kRed);
 
         cout << "Single-Exponential Fit Results (Filtered Michel dt, " << FIT_MIN_FILTERED << "-" << FIT_MAX_FILTERED << " µs):\n";
         cout << Form("N₀ = %.1f ± %.1f", expFit->GetParameter(0), expFit->GetParError(0)) << endl;
@@ -1354,6 +1374,7 @@ int main(int argc, char *argv[]) {
     TFile *outFile = new TFile((OUTPUT_DIR + "/analysis_output.root").c_str(), "RECREATE");
     h_muon_energy->Write();
     h_michel_energy->Write();
+    h_michel_energy_filtered->Write();
     h_dt_michel->Write();
     h_dt_michel_filtered->Write();
     h_energy_vs_dt->Write();
@@ -1370,6 +1391,7 @@ int main(int argc, char *argv[]) {
     // Clean up
     delete h_muon_energy;
     delete h_michel_energy;
+    delete h_michel_energy_filtered;
     delete h_dt_michel;
     delete h_dt_michel_filtered;
     delete h_energy_vs_dt;
