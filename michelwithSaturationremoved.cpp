@@ -39,7 +39,7 @@ const int EV61_THRESHOLD = 1200;
 const double MUON_ENERGY_THRESHOLD = 50;
 const double MICHEL_ENERGY_MIN = 40;
 const double MICHEL_ENERGY_MAX = 1000;
-const double MICHEL_ENERGY_MAX_DT = 400;
+const double MICHEL_ENERGY_MAX_DT = 500;
 const double MICHEL_DT_MIN = 0.8;
 const double MICHEL_DT_MAX = 16.0;
 const int ADCSIZE = 45;
@@ -688,13 +688,15 @@ int main(int argc, char *argv[]) {
                         }
                         if (iBinContent < BS_UNCERTAINTY || iBin == ADCSIZE) {
                             pulse_temp pt;
-                            pt.start = thresholdBin * 16.0 / 1000.0;
+                            // Calculate tpeak and adjust start time
+                            double tpeak = (peakBin - thresholdBin) * 16.0; // in ns
+                            pt.start = (nsTime + tpeak) / 1000.0; // in microseconds
                             pt.peak = peak;
                             pt.end = iBin * 16.0 / 1000.0;
                             pt.peak_position = peakBin;
                             for (int j = peakBin - 1; j >= 1 && h_wf.GetBinContent(j) > BS_UNCERTAINTY; j--) {
                                 if (h_wf.GetBinContent(j) > peak * 0.1) {
-                                    pt.start = j * 16.0 / 1000.0;
+                                    pt.start = j * 16.0 / 1000.0; // Adjust start if earlier significant content
                                 }
                                 pulseEnergy += h_wf.GetBinContent(j);
                             }
