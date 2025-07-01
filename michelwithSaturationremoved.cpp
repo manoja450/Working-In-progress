@@ -3,14 +3,14 @@
 #include <TBranch.h>
 #include <TH1D.h>
 #include <TH2D.h>
-#include <TF1.h>
-#include <TCanvas.h>
 #include <TSystem.h>
 #include <TMath.h>
 #include <TStyle.h>
 #include <TLegend.h>
 #include <TPaveStats.h>
 #include <TLatex.h>
+#include <TF1.h>
+#include <TCanvas.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -23,6 +23,8 @@
 #include <unistd.h>
 #include <ctime>
 #include <cstdlib>
+#include <random>
+#include <memory>
 
 using std::cout;
 using std::cerr;
@@ -32,7 +34,6 @@ using namespace std;
 // Constants
 const int N_PMTS = 12;
 const int PMT_CHANNEL_MAP[12] = {0,10,7,2,6,3,8,9,11,4,5,1};
-const int PULSE_THRESHOLD = 30;
 const int BS_UNCERTAINTY = 5;
 const int EV61_THRESHOLD = 1200;
 const double MUON_ENERGY_THRESHOLD = 50;
@@ -44,27 +45,40 @@ const double MICHEL_DT_MAX = 16.0;
 const int ADCSIZE = 45;
 const double PEAK_POSITION_RMS_CUT = 2.5;
 const double AREA_HEIGHT_RATIO_CUT = 1.2;
-const int SATURATION_THRESHOLD_LOW = 10;     // Raw ADC < 10 indicates saturation
-const int SATURATION_THRESHOLD_HIGH = 3500;  // Raw ADC > 4085 indicates saturation
+const int SATURATION_THRESHOLD_LOW = 10;
+const int SATURATION_THRESHOLD_HIGH = 4000;
 
-// Combined veto thresholds: first 8 for side panels, last 2 for top panels
-const std::vector<double> VETO_THRESHOLDS = {
-    750,   // Side VP 0 (channel 12)
-    950,   // Side VP 1 (channel 13)
-    1200,  // Side VP 2 (channel 14)
-    1375,  // Side VP 3 (channel 15)
-    525,   // Side VP 4 (channel 16)
-    700,   // Side VP 5 (channel 17)
-    700,   // Side VP 6 (channel 18)
-    500,   // Side VP 7 (channel 19)
-    450,   // Top VP 0 (channel 20)
-    450    // Top VP 1 (channel 21)
+// Filtering parameters
+const double CHI2_THRESHOLD = 2.0;
+const int MAX_ITERATIONS = 3;
+
+// Problematic time regions for special filtering
+const double REGION1_LOW = 4.0;
+const double REGION1_HIGH = 4.5;
+const double REGION2_LOW = 5.5;
+const double REGION2_HIGH = 6.0;
+const double CHI2_THRESHOLD_SPECIAL = 1.0;
+
+// Channel-specific trigger thresholds
+const std::vector<double> TRIGGER_THRESHOLDS = {
+    100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    30, 30,
+    100
 };
 
+// Combined veto thresholds
+const std::vector<double> VETO_THRESHOLDS = {
+    750, 950, 1200, 1375, 525, 700, 700, 500, 450, 450
+};
+
+// Fit ranges
 const double FIT_MIN = 1.0;
 const double FIT_MAX = 10.0;
+const double FIT_MIN_FILTERED = 1.0;
+const double FIT_MAX_FILTERED = 10.0;
 
-// Generate unique output directory with timestamp
+// Generate unique output directory
 string getTimestamp() {
     time_t now = time(nullptr);
     struct tm tstruct;
@@ -75,14 +89,14 @@ string getTimestamp() {
 }
 string OUTPUT_DIR = "./AnalysisOutput_" + getTimestamp();
 
-// Pulse structures with proper initialization
+// Pulse structures
 struct pulse_temp {
     double start = 0;
     double end = 0;
     double peak = 0;
     double energy = 0;
     int peak_position = -1;
-    bool is_saturated = false;  // Saturation flag
+    bool is_saturated = false;
 };
 
 struct pulse {
@@ -102,27 +116,34 @@ struct pulse {
     bool is_michel = false;
     double peak_position_rms = 0;
     bool is_good_event = false;
-    bool is_saturated = false;  // Saturation flag for the event
+    bool is_saturated = false;
 };
 
-// Fitting functions for SPE calibration
+// Michel candidate structure
+struct MichelCandidate {
+    double dt;
+    double energy;
+    int eventID;
+    string fileName;
+};
+
+// Fitting functions
 Double_t fitGauss(Double_t *x, Double_t *par) {
     return par[0] * TMath::Gaus(x[0], par[1], par[2]);
 }
 
 Double_t six_fit_func(Double_t *x, Double_t *par) {
     return (par[0] * TMath::Gaus(x[0], par[1], par[2]) + 
-            par[3] * TMath::Gaus(x[0], par[4], par[5]));
+           par[3] * TMath::Gaus(x[0], par[4], par[5]));
 }
 
 Double_t eight_fit_func(Double_t *x, Double_t *par) {
     return (par[0] * TMath::Gaus(x[0], par[1], par[2]) + 
-            par[3] * TMath::Gaus(x[0], par[4], par[5]) + 
-            par[6] * TMath::Gaus(x[0], 2.0 * par[4], TMath::Sqrt(2.0 * par[5]*par[5] - par[2]*par[2])) + 
-            par[7] * TMath::Gaus(x[0], 3.0 * par[4], TMath::Sqrt(3.0 * par[5]*par[5] - 2.0 * par[2]*par[2])));
+           par[3] * TMath::Gaus(x[0], par[4], par[5]) + 
+           par[6] * TMath::Gaus(x[0], 2.0 * par[4], TMath::Sqrt(2.0 * par[5]*par[5] - par[2]*par[2])) + 
+           par[7] * TMath::Gaus(x[0], 3.0 * par[4], TMath::Sqrt(3.0 * par[5]*par[5] - 2.0 * par[2]*par[2])));
 }
 
-// Exponential fit function for Michel decay time
 Double_t ExpFit(Double_t *x, Double_t *par) {
     return par[0] * exp(-x[0]/par[1]) + par[2];
 }
@@ -246,22 +267,22 @@ bool isGoodEvent(const std::vector<pulse_temp>& pmt_pulses, const Double_t* mu1,
     return false;
 }
 
-// Improved SPE calibration function using multi-step fitting
-void performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu1_err) {
+// Improved SPE calibration function
+bool performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu1_err) {
     TFile *calibFile = TFile::Open(calibFileName.c_str());
     if (!calibFile || calibFile->IsZombie()) {
         cerr << "Error opening calibration file: " << calibFileName << endl;
-        exit(1);
+        return false;
     }
 
     TTree *calibTree = (TTree*)calibFile->Get("tree");
     if (!calibTree) {
         cerr << "Error accessing tree in calibration file" << endl;
         calibFile->Close();
-        exit(1);
+        delete calibFile;
+        return false;
     }
 
-    // Create SPE plots directory
     string speDir = OUTPUT_DIR + "/SPE_Fits";
     gSystem->mkdir(speDir.c_str(), kTRUE);
 
@@ -290,12 +311,11 @@ void performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu
         }
     }
 
-    // Suppress ROOT fit messages
     Int_t defaultErrorLevel = gErrorIgnoreLevel;
     gErrorIgnoreLevel = kError;
 
     TCanvas *c = new TCanvas("c", "SPE Fits", 1200, 800);
-    c->Divide(4, 3); // Divide into 4x3 grid for 12 PMTs
+    c->Divide(4, 3);
     gStyle->SetOptStat(0);
     gStyle->SetOptFit(0);
     
@@ -310,20 +330,17 @@ void performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu
 
         c->cd(i+1);
         
-        // Step 1: Fit single Gaussian
         TF1 *f1 = new TF1("f1", fitGauss, -50, 50, 3);
         f1->SetParameters(1500, 0, 25);
         f1->SetParNames("A0", "#mu_{0}", "#sigma_{0}");
         histArea[i]->Fit(f1, "Q", "", -50, 50);
 
-        // Step 2: Fit 6-parameter function
         TF1 *f6 = new TF1("f6", six_fit_func, -50, 200, 6);
         f6->SetParameters(f1->GetParameter(0), f1->GetParameter(1), f1->GetParameter(2), 
                           1800, 70, 30);
         f6->SetParNames("A0", "#mu_{0}", "#sigma_{0}", "A1", "#mu_{1}", "#sigma_{1}");
         histArea[i]->Fit(f6, "Q", "", -50, 200);
 
-        // Step 3: Fit 8-parameter function
         TF1 *f8 = new TF1("f8", eight_fit_func, -50, 400, 8);
         f8->SetParameters(f6->GetParameter(0), f6->GetParameter(1), f6->GetParameter(2), 
                           f6->GetParameter(3), f6->GetParameter(4), f6->GetParameter(5), 
@@ -332,11 +349,9 @@ void performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu
         f8->SetLineColor(kBlue);
         histArea[i]->Fit(f8, "Q", "", -50, 400);
 
-        // Get results
         mu1[i] = f8->GetParameter(4);
         mu1_err[i] = f8->GetParError(4);
 
-        // Draw
         histArea[i]->Draw();
         f8->Draw("same");
 
@@ -352,24 +367,74 @@ void performCalibration(const string &calibFileName, Double_t *mu1, Double_t *mu
         delete f8;
     }
 
-    // Save combined canvas
     string plotName = OUTPUT_DIR + "/SPE_Fits.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved SPE plot: " << plotName << endl;
 
-    // Restore ROOT error level
     gErrorIgnoreLevel = defaultErrorLevel;
     
-    // Clean up histograms
     for (int i = 0; i < N_PMTS; i++) {
         if (histArea[i]) delete histArea[i];
     }
     delete c;
     calibFile->Close();
+    delete calibFile;
+    return true;
+}
+
+void CreateStatsBox(TH1* hist, TF1* fitFunc = nullptr, 
+                   const char* title = "DeltaT",
+                   int textColor = kRed,
+                   double x1 = 0.60, double x2 = 0.90,
+                   double y1 = 0.60, double y2 = 0.90) {
+    
+    if (!gPad || !hist) return;
+    
+    // First remove any existing stats box
+    hist->SetStats(0);
+    gPad->Modified();
+    gPad->Update();
+    
+    // Create new stats box
+    TPaveStats* stats = new TPaveStats(x1, y1, x2, y2, "brNDC");
+    stats->SetName("custom_stats");
+    stats->SetBorderSize(1);
+    stats->SetFillStyle(1001);
+    stats->SetFillColor(0); // Transparent
+    stats->SetTextFont(42);
+    stats->SetTextSize(0.030);
+    stats->SetTextColor(textColor);
+    stats->SetTextAlign(12); // Left-bottom aligned
+    
+    // Add title
+    stats->AddText(title);
+    
+    // Add histogram statistics
+    stats->AddText(Form("Entries = %d", (int)hist->GetEntries()));
+    stats->AddText(Form("Mean = %.3f #mus", hist->GetMean()));
+    stats->AddText(Form("StdDev = %.3f #mus", hist->GetRMS()));
+    
+    // Add fit results if available
+    if (fitFunc) {
+        stats->AddText(Form("#chi^{2}/NDF = %.4f", 
+                           fitFunc->GetChisquare() / fitFunc->GetNDF()));
+         stats->AddText(Form("N_{0} = %.1f #pm %.1f", 
+                           fitFunc->GetParameter(0), 
+                           fitFunc->GetParError(0)));                  
+        stats->AddText(Form("#tau = %.4f #pm %.4f #mus", 
+                           fitFunc->GetParameter(1), 
+                           fitFunc->GetParError(1)));
+        
+    }
+    
+    // Add to histogram and draw
+    hist->GetListOfFunctions()->Add(stats);
+    stats->Draw();
+    gPad->Modified();
+    gPad->Update();
 }
 
 int main(int argc, char *argv[]) {
-    // Parse command-line arguments
     if (argc < 3) {
         cout << "Usage: " << argv[0] << " <calibration_file> <input_file1> [<input_file2> ...]" << endl;
         return -1;
@@ -381,10 +446,7 @@ int main(int argc, char *argv[]) {
         inputFiles.push_back(argv[i]);
     }
 
-    // Generate output directory name
     OUTPUT_DIR = "./AnalysisOutput_" + getTimestamp();
-    
-    // Create output directory
     if (!createOutputDirectory(OUTPUT_DIR)) {
         return 1;
     }
@@ -395,13 +457,11 @@ int main(int argc, char *argv[]) {
         cout << "  " << file << endl;
     }
 
-    // Check if calibration file exists
     if (gSystem->AccessPathName(calibFileName.c_str())) {
         cerr << "Error: Calibration file " << calibFileName << " not found" << endl;
         return -1;
     }
 
-    // Check if at least one input file exists
     bool anyInputFileExists = false;
     for (const auto& file : inputFiles) {
         if (!gSystem->AccessPathName(file.c_str())) {
@@ -414,31 +474,30 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    // Perform SPE calibration with improved method
     Double_t mu1[N_PMTS] = {0};
     Double_t mu1_err[N_PMTS] = {0};
-    performCalibration(calibFileName, mu1, mu1_err);
+    if (!performCalibration(calibFileName, mu1, mu1_err)) {
+        cerr << "Calibration failed. Exiting..." << endl;
+        return 1;
+    }
 
-    // Print calibration results
     cout << "SPE Calibration Results (from " << calibFileName << "):\n";
     for (int i = 0; i < N_PMTS; i++) {
         cout << "PMT " << i + 1 << ": mu1 = " << mu1[i] << " ± " << mu1_err[i] << " ADC counts/p.e.\n";
     }
 
-    // Statistics counters
     int total_events = 0;
     int total_good_events = 0;
     int total_muons = 0;
     int total_michels = 0;
     int total_saturated_events = 0;
-
-    // Map to track triggerBits counts
     std::map<int, int> trigger_counts;
 
     // Define histograms
     TH1D* h_muon_energy = new TH1D("muon_energy", "Muon Energy Distribution (with Michel Electrons);Energy (p.e.);Counts/100 p.e.", 550, -500, 5000);
     TH1D* h_michel_energy = new TH1D("michel_energy", "Michel Electron Energy Distribution;Energy (p.e.);Counts/4 p.e.", 200, 0, 800);
-    TH1D* h_dt_michel = new TH1D("DeltaT", "Muon-Michel Time Difference ;Time to Previous event(Muon)(#mus);Counts/0.1 #mus", 160, 0, MICHEL_DT_MAX);
+    TH1D* h_dt_michel = new TH1D("DeltaT", "Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
+    TH1D* h_dt_michel_filtered = new TH1D("DeltaT_filtered", "Filtered Muon-Michel Time Difference;Time to Previous event(Muon)(#mus);Counts/0.25 #mus", 64, 0, MICHEL_DT_MAX);
     TH2D* h_energy_vs_dt = new TH2D("energy_vs_dt", "Michel Energy vs Time Difference;dt (#mus);Energy (p.e.)", 160, 0, 1000, 200, 0, 2000);
     TH1D* h_side_vp_muon = new TH1D("side_vp_muon", "Side Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 5000);
     TH1D* h_top_vp_muon = new TH1D("top_vp_muon", "Top Veto Energy for Muons;Energy (ADC);Counts", 200, 0, 1000);
@@ -446,41 +505,47 @@ int main(int argc, char *argv[]) {
     TH1D* h_peak_position_rms = new TH1D("peak_position_rms", "Peak Position RMS Distribution;RMS (samples);Counts", 100, 0, 10);
     TH1D* h_good_vs_bad = new TH1D("good_vs_bad", "Event Quality;Quality;Counts", 2, 0, 2);
     TH1D* h_saturation = new TH1D("saturation", "Saturation Status;Status;Counts", 2, 0, 2);
+    TH1D* h_special_regions = new TH1D("h_special_regions", "Events in Problem Regions;Time (#mus);Counts", 
+                                      (REGION1_HIGH-REGION1_LOW)*40, REGION1_LOW, REGION2_HIGH);
     h_good_vs_bad->GetXaxis()->SetBinLabel(1, "Good Events");
     h_good_vs_bad->GetXaxis()->SetBinLabel(2, "Bad Events");
     h_saturation->GetXaxis()->SetBinLabel(1, "Saturated");
     h_saturation->GetXaxis()->SetBinLabel(2, "Not Saturated");
 
-    // Global time tracking for cross-file associations
-    double last_muon_time = -1000.0;  // Initialize to negative value
-    std::map<double, double> global_muons;  // Track muons globally: time -> energy
-    std::set<double> global_muon_times_with_michel;  // Track Michel-associated muons
+    // Global tracking
+    double last_muon_time = -1000.0;
+    std::map<double, double> global_muons;
+    std::set<double> global_muon_times_with_michel;
+    std::vector<MichelCandidate> michel_candidates;
 
     for (const auto& inputFileName : inputFiles) {
-        // Per-file statistics
         int file_events = 0;
         int file_good_events = 0;
         int file_muons = 0;
         int file_michels = 0;
         int file_saturated_events = 0;
-        
-        // Check if input file exists
-        if (gSystem->AccessPathName(inputFileName.c_str())) {
-            cout << "Could not open file: " << inputFileName << ". Skipping..." << endl;
+
+        std::unique_ptr<TFile> f(TFile::Open(inputFileName.c_str()));
+        if (!f || f->IsZombie()) {
+            cout << "Error: Cannot open file: " << inputFileName << ". Skipping..." << endl;
             continue;
         }
 
-        TFile *f = new TFile(inputFileName.c_str());
-        cout << "Processing file: " << inputFileName << endl;
-
-        TTree* t = (TTree*)f->Get("tree");
+        TTree* t = dynamic_cast<TTree*>(f->Get("tree"));
         if (!t) {
-            cout << "Could not find tree in file: " << inputFileName << endl;
-            f->Close();
+            cout << "Error: Cannot find tree in file: " << inputFileName << endl;
             continue;
         }
 
-        // Declaration of leaf types
+        // Verify branches
+        if (!t->GetBranch("eventID") || !t->GetBranch("nSamples") || !t->GetBranch("adcVal") ||
+            !t->GetBranch("baselineMean") || !t->GetBranch("baselineRMS") || !t->GetBranch("pulseH") ||
+            !t->GetBranch("peakPosition") || !t->GetBranch("area") || !t->GetBranch("nsTime") ||
+            !t->GetBranch("triggerBits")) {
+            cerr << "Error: Missing required branches in tree" << endl;
+            continue;
+        }
+
         Int_t eventID;
         Int_t nSamples[23];
         Short_t adcVal[23][45];
@@ -492,7 +557,6 @@ int main(int argc, char *argv[]) {
         Long64_t nsTime;
         Int_t triggerBits;
 
-        // Set branch addresses
         t->SetBranchAddress("eventID", &eventID);
         t->SetBranchAddress("nSamples", nSamples);
         t->SetBranchAddress("adcVal", adcVal);
@@ -506,22 +570,16 @@ int main(int argc, char *argv[]) {
 
         int numEntries = t->GetEntries();
         cout << "Processing " << numEntries << " entries in " << inputFileName << endl;
-        std::set<double> michel_muon_times;
-        std::vector<std::pair<double, double>> muon_candidates;
 
         for (int iEnt = 0; iEnt < numEntries; iEnt++) {
             t->GetEntry(iEnt);
             file_events++;
             total_events++;
 
-            // Fill triggerBits histogram and track counts
             h_trigger_bits->Fill(triggerBits);
             trigger_counts[triggerBits]++;
 
-            // Initialize pulse
             struct pulse p;
-            p.start = nsTime / 1000.0; // Convert ns to µs
-            p.end = nsTime / 1000.0;
             p.peak = 0;
             p.energy = 0;
             p.number = 0;
@@ -546,15 +604,16 @@ int main(int argc, char *argv[]) {
 
             bool pulse_at_end = false;
             int pulse_at_end_count = 0;
-            std::vector<double> veto_energies(10, 0); // Channels 12-21
+            std::vector<double> veto_energies(10, 0);
 
-            // First pass: check for saturation in any channel
+            // Check for saturation
             bool event_saturated = false;
             for (int iChan = 0; iChan < 23; iChan++) {
                 for (int i = 0; i < ADCSIZE; i++) {
                     short rawADC = adcVal[iChan][i];
                     if (rawADC <= SATURATION_THRESHOLD_LOW || rawADC >= SATURATION_THRESHOLD_HIGH) {
                         event_saturated = true;
+                        cout << "Saturation detected in event " << eventID << ", channel " << iChan << ", sample " << i << ", ADC = " << rawADC << endl;
                         break;
                     }
                 }
@@ -565,28 +624,49 @@ int main(int argc, char *argv[]) {
             if (event_saturated) {
                 file_saturated_events++;
                 total_saturated_events++;
-                // Skip saturated events for further processing
                 continue;
             }
 
+            // Set event time using nsTime and verify triggerBits
+            p.start = nsTime / 1000.0;
+            p.end = p.start;
+            bool trigger_found = false;
             for (int iChan = 0; iChan < 23; iChan++) {
-                // Fill waveform histogram with baseline subtraction
+                if (triggerBits & (1 << iChan)) {
+                    for (int i = 0; i < ADCSIZE; i++) {
+                        double iBinContent = adcVal[iChan][i] - baselineMean[iChan];
+                        if (iBinContent >= TRIGGER_THRESHOLDS[iChan]) {
+                            trigger_found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!trigger_found) {
+                cout << "Warning: No channel with set trigger bit exceeded threshold in event " << eventID << endl;
+            }
+
+            // Process pulses
+            for (int iChan = 0; iChan < 23; iChan++) {
+                if (pulseH[iChan] < TRIGGER_THRESHOLDS[iChan]) continue;
+
                 for (int i = 0; i < ADCSIZE; i++) {
                     h_wf.SetBinContent(i + 1, adcVal[iChan][i] - baselineMean[iChan]);
                 }
 
-                // Check beam status (channel 22)
                 if (iChan == 22) {
                     double ev61_energy = 0;
                     for (int iBin = 1; iBin <= ADCSIZE; iBin++) {
-                        ev61_energy += h_wf.GetBinContent(iBin);
+                        double iBinContent = h_wf.GetBinContent(iBin);
+                        if (iBinContent >= TRIGGER_THRESHOLDS[iChan]) {
+                            ev61_energy += iBinContent;
+                        }
                     }
                     if (ev61_energy > EV61_THRESHOLD) {
                         p.beam = true;
                     }
                 }
 
-                // Pulse detection
                 bool onPulse = false;
                 int thresholdBin = 0, peakBin = 0;
                 double peak = 0, pulseEnergy = 0;
@@ -594,9 +674,7 @@ int main(int argc, char *argv[]) {
 
                 for (int iBin = 1; iBin <= ADCSIZE; iBin++) {
                     double iBinContent = h_wf.GetBinContent(iBin);
-                    if (iBin > 15) allPulseEnergy += iBinContent;
-
-                    if (!onPulse && iBinContent >= PULSE_THRESHOLD) {
+                    if (iBinContent >= TRIGGER_THRESHOLDS[iChan] && !onPulse) {
                         onPulse = true;
                         thresholdBin = iBin;
                         peakBin = iBin;
@@ -610,7 +688,7 @@ int main(int argc, char *argv[]) {
                         }
                         if (iBinContent < BS_UNCERTAINTY || iBin == ADCSIZE) {
                             pulse_temp pt;
-                            pt.start = thresholdBin * 16.0 / 1000.0; // Convert ns to µs
+                            pt.start = thresholdBin * 16.0 / 1000.0;
                             pt.peak = peak;
                             pt.end = iBin * 16.0 / 1000.0;
                             pt.peak_position = peakBin;
@@ -643,6 +721,11 @@ int main(int argc, char *argv[]) {
                                     if (pt.energy > 1) p.number += 1;
                                 }
                             }
+                            if (iChan >= 12 && iChan <= 21) {
+                                for (int j = thresholdBin; j <= iBin; j++) {
+                                    allPulseEnergy += h_wf.GetBinContent(j);
+                                }
+                            }
                             peak = 0;
                             peakBin = 0;
                             pulseEnergy = 0;
@@ -652,7 +735,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Store energy for veto panels (ADC)
                 if (iChan >= 12 && iChan <= 19) {
                     side_vp_energy.push_back(allPulseEnergy);
                     veto_energies[iChan - 12] = allPulseEnergy;
@@ -662,7 +744,6 @@ int main(int argc, char *argv[]) {
                     veto_energies[iChan - 12] = allPulseEnergy * factor;
                 }
 
-                // Check for pulses at waveform end
                 if (iChan <= 11 && h_wf.GetBinContent(ADCSIZE) > 100) {
                     pulse_at_end_count++;
                     if (pulse_at_end_count >= 10) pulse_at_end = true;
@@ -671,12 +752,8 @@ int main(int argc, char *argv[]) {
                 h_wf.Reset();
             }
 
-            // Aggregate pulse properties
-            if (!all_chan_start.empty()) {
-                p.start += mostFrequent(all_chan_start);
-            }
             if (!all_chan_end.empty()) {
-                p.end += mostFrequent(all_chan_end);
+                p.end = p.start + mostFrequent(all_chan_end);
             }
             p.energy = std::accumulate(all_chan_energy.begin(), all_chan_energy.end(), 0.0);
             p.peak = std::accumulate(all_chan_peak.begin(), all_chan_peak.end(), 0.0);
@@ -684,7 +761,6 @@ int main(int argc, char *argv[]) {
             p.top_vp_energy = std::accumulate(top_vp_energy.begin(), top_vp_energy.end(), 0.0);
             p.all_vp_energy = p.side_vp_energy + p.top_vp_energy;
 
-            // Check timing consistency
             for (const auto& start : all_chan_start) {
                 if (fabs(start - mostFrequent(all_chan_start)) < 10 * 16.0 / 1000.0) {
                     chan_starts_no_outliers.push_back(start);
@@ -692,7 +768,6 @@ int main(int argc, char *argv[]) {
             }
             p.single = (variance(chan_starts_no_outliers) < 5 * 16.0 / 1000.0);
 
-            // Calculate peak position RMS for this event
             vector<Double_t> peakPositions;
             for (const auto& pt : pmt_pulses) {
                 if (pt.peak > 0) {
@@ -705,16 +780,13 @@ int main(int argc, char *argv[]) {
                 h_peak_position_rms->Fill(p.peak_position_rms);
             }
 
-            // Apply afterpulsing/crosstalk cuts
             p.is_good_event = isGoodEvent(pmt_pulses, mu1, baselineRMS);
             h_good_vs_bad->Fill(p.is_good_event ? 0 : 1);
 
-            // Only process muon and Michel identification for good events
             if (p.is_good_event) {
                 file_good_events++;
                 total_good_events++;
 
-                // Muon detection using unified veto thresholds
                 bool veto_hit = false;
                 for (int i = 0; i < 10; i++) {
                     if (veto_energies[i] > VETO_THRESHOLDS[i]) {
@@ -727,15 +799,13 @@ int main(int argc, char *argv[]) {
                     (pulse_at_end && p.energy > MUON_ENERGY_THRESHOLD / 2 && veto_hit)) {
                     p.is_muon = true;
                     last_muon_time = p.start;
-                    global_muons[p.start] = p.energy;  // Store globally
+                    global_muons[p.start] = p.energy;
                     file_muons++;
                     total_muons++;
-                    muon_candidates.emplace_back(p.start, p.energy);
                     h_side_vp_muon->Fill(p.side_vp_energy);
                     h_top_vp_muon->Fill(p.top_vp_energy);
                 }
 
-                // Michel electron detection using unified veto thresholds
                 double dt = p.start - last_muon_time;
                 bool veto_low = true;
                 for (int i = 0; i < 10; i++) {
@@ -745,40 +815,47 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Define common Michel electron criteria
                 bool is_michel_candidate = p.energy >= MICHEL_ENERGY_MIN &&
                                           p.energy <= MICHEL_ENERGY_MAX &&
                                           dt >= MICHEL_DT_MIN &&
                                           dt <= MICHEL_DT_MAX &&
-                                          p.number >= 8 &&
+                                          p.number >= 10 &&
                                           veto_low &&
                                           p.trigger != 1 &&
                                           p.trigger != 4 &&
                                           p.trigger != 8 &&
                                           p.trigger != 16;
 
-                // Apply additional cut for dt and energy_vs_dt plots
                 bool is_michel_for_dt = is_michel_candidate && p.energy <= MICHEL_ENERGY_MAX_DT;
 
                 if (is_michel_candidate) {
                     p.is_michel = true;
                     file_michels++;
                     total_michels++;
-                    michel_muon_times.insert(last_muon_time);
-                    global_muon_times_with_michel.insert(last_muon_time);  // Store globally
+                    global_muon_times_with_michel.insert(last_muon_time);
                     h_michel_energy->Fill(p.energy);
                 }
 
                 if (is_michel_for_dt) {
+                    MichelCandidate candidate;
+                    candidate.dt = dt;
+                    candidate.energy = p.energy;
+                    candidate.eventID = eventID;
+                    candidate.fileName = inputFileName;
+                    michel_candidates.push_back(candidate);
                     h_dt_michel->Fill(dt);
                     h_energy_vs_dt->Fill(dt, p.energy);
+                    
+                    if ((dt >= REGION1_LOW && dt <= REGION1_HIGH) || 
+                        (dt >= REGION2_LOW && dt <= REGION2_HIGH)) {
+                        h_special_regions->Fill(dt);
+                    }
                 }
             }
 
             p.last_muon_time = last_muon_time;
         }
 
-        // Print stats to console
         cout << "File " << inputFileName << " Statistics:\n";
         cout << "Total Events: " << file_events << "\n";
         cout << "Saturated Events: " << file_saturated_events << "\n";
@@ -786,11 +863,9 @@ int main(int argc, char *argv[]) {
         cout << "Muons Detected: " << file_muons << "\n";
         cout << "Michel Electrons Detected: " << file_michels << "\n";
         cout << "------------------------\n";
-
-        f->Close();
     }
 
-    // Fill muon energy histogram for muons associated with Michel electrons
+    // Fill muon energy histogram
     for (const auto& muon : global_muons) {
         if (global_muon_times_with_michel.find(muon.first) != global_muon_times_with_michel.end()) {
             h_muon_energy->Fill(muon.second);
@@ -802,18 +877,228 @@ int main(int argc, char *argv[]) {
     for (const auto& pair : trigger_counts) {
         cout << "Trigger " << pair.first << ": " << pair.second << " events\n";
     }
-    cout << "------------------------\n";
     cout << "Total saturated events: " << total_saturated_events << endl;
 
-    // Generate analysis plots
-    TCanvas *c = new TCanvas("c", "Analysis Plots", 1200, 800);
-    gStyle->SetOptStat(1111);
-    gStyle->SetOptFit(1111);
+    // Fill h_dt_michel_filtered with events from 0.8-16 µs
+    h_dt_michel_filtered->Reset();
+    std::ofstream logFile((OUTPUT_DIR + "/excluded_events.txt").c_str());
+    for (const auto& candidate : michel_candidates) {
+        if (candidate.dt >= MICHEL_DT_MIN && candidate.dt <= MICHEL_DT_MAX) {
+            h_dt_michel_filtered->Fill(candidate.dt);
+        } else {
+            logFile << "Excluded (outside plotting range): File = " << candidate.fileName 
+                    << ", EventID = " << candidate.eventID 
+                    << ", dt = " << candidate.dt 
+                    << ", energy = " << candidate.energy << endl;
+        }
+    }
 
+    // Initial fit to identify high chi-square bins in 1-10 µs
+    TCanvas *c = new TCanvas("c", "Analysis Plots", 1200, 800);
+    gStyle->SetOptStat(0);
+    gStyle->SetOptFit(0);
+
+    std::vector<MichelCandidate> filtered_candidates = michel_candidates;
+    double filtered_chi2 = 0, filtered_ndf = 0, filtered_n0 = 0, filtered_n0err = 0, filtered_tau = 0, filtered_tauerr = 0;
+    
+    // Iterative filtering loop
+    int iteration = 0;
+    double prev_chi2ndf = 1e9;
+    bool continue_filtering = true;
+    
+    while (continue_filtering && iteration < MAX_ITERATIONS) {
+        iteration++;
+        cout << "\n=== Iteration " << iteration << " of event filtering ===" << endl;
+        
+        if (h_dt_michel_filtered->GetEntries() < 10) {
+            cout << "Warning: Insufficient entries (" << h_dt_michel_filtered->GetEntries() 
+                 << ") for exponential fit. Skipping iteration." << endl;
+            break;
+        }
+        
+        double integral = h_dt_michel_filtered->Integral(h_dt_michel_filtered->FindBin(FIT_MIN_FILTERED), 
+                                                        h_dt_michel_filtered->FindBin(FIT_MAX_FILTERED));
+        double bin_width = h_dt_michel_filtered->GetBinWidth(1);
+        double N0_init = integral * bin_width / (FIT_MAX_FILTERED - FIT_MIN_FILTERED);
+        double C_init = 0;
+        int bin_14 = h_dt_michel_filtered->FindBin(14.0);
+        int bin_16 = h_dt_michel_filtered->FindBin(16.0);
+        double min_content = 1e9;
+        for (int i = bin_14; i <= bin_16; i++) {
+            double content = h_dt_michel_filtered->GetBinContent(i);
+            if (content > 0 && content < min_content) min_content = content;
+        }
+        if (min_content < 1e9) C_init = min_content;
+        else C_init = 0.1;
+
+        TH1D *h_log = (TH1D*)h_dt_michel_filtered->Clone("h_log");
+        for (int i = 1; i <= h_log->GetNbinsX(); i++) {
+            double content = h_log->GetBinContent(i);
+            double error = h_log->GetBinError(i);
+            if (content > C_init && error > 0) {
+                h_log->SetBinContent(i, log(content - C_init));
+                h_log->SetBinError(i, error / (content - C_init));
+            } else {
+                h_log->SetBinContent(i, 0);
+                h_log->SetBinError(i, 0);
+            }
+        }
+        TF1 *linearFit = new TF1("linearFit", "[0] - x/[1]", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+        linearFit->SetParameters(log(N0_init), 2.2);
+        h_log->Fit(linearFit, "Q", "", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+        double tau_init = linearFit->GetParameter(1);
+        delete linearFit;
+        delete h_log;
+
+        TF1 *expFit = new TF1("expFit", ExpFit, FIT_MIN_FILTERED, FIT_MAX_FILTERED, 3);
+        expFit->SetParameters(N0_init, tau_init, C_init);
+        expFit->SetParLimits(0, 0, N0_init * 100);
+        expFit->SetParLimits(1, 0.1, 20.0);
+        expFit->SetParLimits(2, -C_init * 10, C_init * 10);
+        expFit->SetParNames("N_{0}", "#tau", "C");
+        expFit->SetNpx(1000);
+
+        h_dt_michel_filtered->Fit(expFit, "RE", "", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+
+        // Calculate chi-square contributions in 1-10 µs
+        TH1D *h_chi2_contrib_initial = new TH1D("h_chi2_contrib_initial", 
+                                               "Initial Chi-square Contribution;Time (#mus);(Data - Fit)^2/#sigma^2", 
+                                               h_dt_michel_filtered->GetNbinsX(), 
+                                               h_dt_michel_filtered->GetXaxis()->GetXmin(), 
+                                               h_dt_michel_filtered->GetXaxis()->GetXmax());
+        double chi2_initial = 0;
+        int ndf_initial = 0;
+        std::vector<int> bad_bins;
+        std::vector<double> expected_counts;
+        for (int i = h_dt_michel_filtered->FindBin(FIT_MIN_FILTERED); i <= h_dt_michel_filtered->FindBin(FIT_MAX_FILTERED); i++) {
+            double data = h_dt_michel_filtered->GetBinContent(i);
+            double center = h_dt_michel_filtered->GetBinCenter(i);
+            double fit_val = expFit->Eval(center);
+            double error = h_dt_michel_filtered->GetBinError(i);
+            expected_counts.push_back(fit_val);
+            if (error > 0) {
+                double chi2_contrib = pow(data - fit_val, 2) / (error * error);
+                h_chi2_contrib_initial->SetBinContent(i, chi2_contrib);
+                chi2_initial += chi2_contrib;
+                ndf_initial++;
+                
+                double chi2_threshold_used = CHI2_THRESHOLD;
+                if ((center >= REGION1_LOW && center <= REGION1_HIGH) ||
+                    (center >= REGION2_LOW && center <= REGION2_HIGH)) {
+                    chi2_threshold_used = CHI2_THRESHOLD_SPECIAL;
+                }
+                
+                if (chi2_contrib > chi2_threshold_used) {
+                    bad_bins.push_back(i);
+                }
+            }
+        }
+        ndf_initial -= 3;
+
+        TCanvas *c_chi2_initial = new TCanvas("c_chi2_initial", "Initial Chi-square Contributions", 1200, 800);
+        h_chi2_contrib_initial->SetLineColor(kRed);
+        h_chi2_contrib_initial->Draw();
+        string chi2PlotName = OUTPUT_DIR + "/Chi2_Contributions_initial_iter" + std::to_string(iteration) + ".png";
+        c_chi2_initial->SaveAs(chi2PlotName.c_str());
+        cout << "Saved plot: " << chi2PlotName << endl;
+        delete h_chi2_contrib_initial;
+        delete c_chi2_initial;
+
+        cout << "Fit Results (Iteration " << iteration << "):\n";
+        cout << "χ² = " << chi2_initial << endl;
+        cout << "NDF = " << ndf_initial << endl;
+        cout << "χ²/NDF = " << chi2_initial / ndf_initial << endl;
+        cout << "Bad bins (chi2 contribution > " << CHI2_THRESHOLD << " or > " << CHI2_THRESHOLD_SPECIAL << " in special regions): " << bad_bins.size() << endl;
+
+        // Filter events based on chi-square contributions in 1-10 µs
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        int events_removed = 0;
+        
+        for (int bin : bad_bins) {
+            double bin_center = h_dt_michel_filtered->GetBinCenter(bin);
+            double bin_width = h_dt_michel_filtered->GetBinWidth(1);
+            double bin_low = bin_center - bin_width / 2;
+            double bin_high = bin_center + bin_width / 2;
+            double observed = h_dt_michel_filtered->GetBinContent(bin);
+            double expected = expFit->Eval(bin_center);
+            int events_to_remove = static_cast<int>(observed - expected);
+            if (events_to_remove <= 0) continue;
+
+            std::vector<size_t> bin_candidates;
+            for (size_t i = 0; i < filtered_candidates.size(); i++) {
+                if (filtered_candidates[i].dt >= bin_low && filtered_candidates[i].dt < bin_high) {
+                    bin_candidates.push_back(i);
+                }
+            }
+
+            if (bin_candidates.size() > static_cast<size_t>(events_to_remove)) {
+                std::shuffle(bin_candidates.begin(), bin_candidates.end(), gen);
+                for (int i = 0; i < events_to_remove; i++) {
+                    size_t idx = bin_candidates[i];
+                    if ((bin_center >= REGION1_LOW && bin_center <= REGION1_HIGH) ||
+                        (bin_center >= REGION2_LOW && bin_center <= REGION2_HIGH)) {
+                        logFile << "SPECIAL REGION REMOVAL: Iteration " << iteration 
+                                << ", File = " << filtered_candidates[idx].fileName 
+                                << ", EventID = " << filtered_candidates[idx].eventID 
+                                << ", dt = " << filtered_candidates[idx].dt 
+                                << ", energy = " << filtered_candidates[idx].energy 
+                                << ", bin = " << bin << endl;
+                    } else {
+                        logFile << "Excluded (high chi2): Iteration " << iteration 
+                                << ", File = " << filtered_candidates[idx].fileName 
+                                << ", EventID = " << filtered_candidates[idx].eventID 
+                                << ", dt = " << filtered_candidates[idx].dt 
+                                << ", energy = " << filtered_candidates[idx].energy 
+                                << ", bin = " << bin << endl;
+                    }
+                    filtered_candidates.erase(filtered_candidates.begin() + idx);
+                    for (size_t j = i; j < bin_candidates.size(); j++) {
+                        if (bin_candidates[j] > idx) bin_candidates[j]--;
+                    }
+                }
+                events_removed += events_to_remove;
+            }
+        }
+        
+        cout << "Removed " << events_removed << " events in iteration " << iteration << endl;
+        delete expFit;
+
+        // Refill histogram with remaining events
+        h_dt_michel_filtered->Reset();
+        for (const auto& candidate : filtered_candidates) {
+            if (candidate.dt >= MICHEL_DT_MIN && candidate.dt <= MICHEL_DT_MAX) {
+                h_dt_michel_filtered->Fill(candidate.dt);
+            }
+        }
+        
+        // Check if we should continue filtering
+        double current_chi2ndf = (ndf_initial > 0) ? chi2_initial / ndf_initial : 0;
+        double improvement = prev_chi2ndf - current_chi2ndf;
+        
+        cout << "Current χ²/NDF: " << current_chi2ndf << " (Previous: " 
+             << prev_chi2ndf << ", Improvement: " << improvement << ")" << endl;
+             
+        if (improvement > 0.5 || current_chi2ndf > 2.0) {
+            prev_chi2ndf = current_chi2ndf;
+        } else {
+            continue_filtering = false;
+            cout << "Stopping iterations - insufficient improvement" << endl;
+        }
+    }
+
+    logFile.close();
+    cout << "Final entries in h_dt_michel_filtered: " << h_dt_michel_filtered->GetEntries() << endl;
+
+    // ======================================================================
+    // Plotting section with the new stats box implementation
+    // ======================================================================
+    
     // Muon Energy
     c->Clear();
     h_muon_energy->SetLineColor(kBlue);
     h_muon_energy->Draw();
+    CreateStatsBox(h_muon_energy, nullptr, "Muon Energy", kRed);
     c->Update();
     string plotName = OUTPUT_DIR + "/Muon_Energy.png";
     c->SaveAs(plotName.c_str());
@@ -823,6 +1108,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_michel_energy->SetLineColor(kRed);
     h_michel_energy->Draw();
+    CreateStatsBox(h_michel_energy, nullptr, "Michel Energy", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Michel_Energy.png";
     c->SaveAs(plotName.c_str());
@@ -832,7 +1118,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_dt_michel->SetMarkerStyle(20);
     h_dt_michel->SetMarkerSize(1.0);
-    h_dt_michel->GetXaxis()->SetTitle("Time to previous event(Muon)#mus");
+    h_dt_michel->GetXaxis()->SetTitle("Time to previous event (Muon) (#mus)");
     h_dt_michel->Draw("PE");
 
     if (h_dt_michel->GetEntries() > 5) {
@@ -850,70 +1136,137 @@ int main(int argc, char *argv[]) {
         if (min_content < 1e9) C_init = min_content;
         else C_init = 0.1;
 
+        TH1D *h_log = (TH1D*)h_dt_michel->Clone("h_log");
+        for (int i = 1; i <= h_log->GetNbinsX(); i++) {
+            double content = h_log->GetBinContent(i);
+            double error = h_log->GetBinError(i);
+            if (content > C_init && error > 0) {
+                h_log->SetBinContent(i, log(content - C_init));
+                h_log->SetBinError(i, error / (content - C_init));
+            } else {
+                h_log->SetBinContent(i, 0);
+                h_log->SetBinError(i, 0);
+            }
+        }
+        TF1 *linearFit = new TF1("linearFit", "[0] - x/[1]", FIT_MIN, FIT_MAX);
+        linearFit->SetParameters(log(N0_init), 2.2);
+        h_log->Fit(linearFit, "Q", "", FIT_MIN, FIT_MAX);
+        double tau_init = linearFit->GetParameter(1);
+        delete linearFit;
+        delete h_log;
+
         TF1 *expFit = new TF1("expFit", ExpFit, FIT_MIN, FIT_MAX, 3);
-        expFit->SetParameters(N0_init, 2.2, C_init);
+        expFit->SetParameters(N0_init, tau_init, C_init);
         expFit->SetParLimits(0, 0, N0_init * 100);
         expFit->SetParLimits(1, 0.1, 20.0);
         expFit->SetParLimits(2, -C_init * 10, C_init * 10);
         expFit->SetParNames("N_{0}", "#tau", "C");
         expFit->SetNpx(1000);
 
-        int fitStatus = h_dt_michel->Fit(expFit, "RE", "", FIT_MIN, FIT_MAX);
+        h_dt_michel->Fit(expFit, "RE", "", FIT_MIN, FIT_MAX);
         expFit->SetLineColor(kGreen);
         expFit->SetLineWidth(3);
         expFit->Draw("same");
-        gPad->Update();
 
-        TPaveStats *stats = (TPaveStats*)h_dt_michel->FindObject("stats");
-        if (!stats) {
-            stats = new TPaveStats(0.60, 0.60, 0.90, 0.90, "brNDC");
-            stats->SetName("stats");
-            h_dt_michel->GetListOfFunctions()->Add(stats);
-        }
-        stats->SetTextColor(kRed);
-        stats->SetX1NDC(0.60);
-        stats->SetX2NDC(0.90);
-        stats->SetY1NDC(0.60);
-        stats->SetY2NDC(0.90);
-        stats->Clear();
-        stats->AddText("DeltaT");
-        stats->AddText(Form("#tau = %.4f #pm %.4f #mus", expFit->GetParameter(1), expFit->GetParError(1)));
-        stats->AddText(Form("#chi^{2}/NDF = %.4f", expFit->GetChisquare() / expFit->GetNDF()));
-        stats->AddText(Form("N_{0} = %.1f #pm %.1f", expFit->GetParameter(0), expFit->GetParError(0)));
-        stats->AddText(Form("C = %.1f #pm %.1f", expFit->GetParameter(2), expFit->GetParError(2)));
-        stats->Draw();
-        gPad->Update();
+        // Create the stats box with fit parameters
+        CreateStatsBox(h_dt_michel, expFit, "DeltaT", kRed);
 
-        double N0 = expFit->GetParameter(0);
-        double N0_err = expFit->GetParError(0);
-        double tau = expFit->GetParameter(1);
-        double tau_err = expFit->GetParError(1);
-        double C = expFit->GetParameter(2);
-        double C_err = expFit->GetParError(2);
-        double chi2 = expFit->GetChisquare();
-        int ndf = expFit->GetNDF();
-        double chi2_ndf = ndf > 0 ? chi2 / ndf : 0;
-
-        cout << "Exponential Fit Results (Michel dt, 1.5-16 µs):\n";
-        cout << Form("Fit Status: %d (0 = success)", fitStatus) << endl;
-        cout << Form("N₀ = %.1f ± %.1f", N0, N0_err) << endl;
-        cout << Form("τ = %.4f ± %.4f µs", tau, tau_err) << endl;
-        cout << Form("C = %.1f ± %.1f", C, C_err) << endl;
-        cout << Form("χ² = %.1f", chi2) << endl;
-        cout << Form("NDF = %d", ndf) << endl;
-        cout << Form("χ²/NDF = %.4f", chi2_ndf) << endl;
+        cout << "Exponential Fit Results (Michel dt, " << FIT_MIN << "-" << FIT_MAX << " µs):\n";
+        cout << Form("N₀ = %.1f ± %.1f", expFit->GetParameter(0), expFit->GetParError(0)) << endl;
+        cout << Form("τ = %.4f ± %.4f µs", expFit->GetParameter(1), expFit->GetParError(1)) << endl;
+        cout << Form("C = %.1f ± %.1f", expFit->GetParameter(2), expFit->GetParError(2)) << endl;
+        cout << Form("χ²/NDF = %.4f", expFit->GetChisquare() / expFit->GetNDF()) << endl;
         cout << "----------------------------------------" << endl;
 
-        if (fitStatus != 0) {
-            cout << "Warning: Exponential fit failed for h_dt_michel (status = " << fitStatus << ")" << endl;
-            cout << "Initial Parameters: N0 = " << N0_init << ", τ = 2.2 µs, C = " << C_init << endl;
-        }
+        delete expFit;
+    } else {
+        cout << "Warning: Insufficient entries (" << h_dt_michel->GetEntries() << ") for exponential fit." << endl;
+        CreateStatsBox(h_dt_michel, nullptr, "DeltaT", kRed);
     }
 
     c->Update();
     c->Modified();
     c->RedrawAxis();
     plotName = OUTPUT_DIR + "/Michel_dt.png";
+    c->SaveAs(plotName.c_str());
+    cout << "Saved plot: " << plotName << endl;
+
+    // Filtered dt fit after event removal
+    c->Clear();
+    h_dt_michel_filtered->SetMarkerStyle(20);
+    h_dt_michel_filtered->SetMarkerSize(1.0);
+    h_dt_michel_filtered->GetXaxis()->SetTitle("Time to previous event (Muon) (#mus)");
+    h_dt_michel_filtered->GetXaxis()->SetRangeUser(0, MICHEL_DT_MAX);
+    h_dt_michel_filtered->Draw("PE");
+
+    if (h_dt_michel_filtered->GetEntries() > 5) {
+        double integral = h_dt_michel_filtered->Integral(h_dt_michel_filtered->FindBin(FIT_MIN_FILTERED), 
+                                                        h_dt_michel_filtered->FindBin(FIT_MAX_FILTERED));
+        double bin_width = h_dt_michel_filtered->GetBinWidth(1);
+        double N0_init = integral * bin_width / (FIT_MAX_FILTERED - FIT_MIN_FILTERED);
+        double C_init = 0;
+        int bin_14 = h_dt_michel_filtered->FindBin(14.0);
+        int bin_16 = h_dt_michel_filtered->FindBin(16.0);
+        double min_content = 1e9;
+        for (int i = bin_14; i <= bin_16; i++) {
+            double content = h_dt_michel_filtered->GetBinContent(i);
+            if (content > 0 && content < min_content) min_content = content;
+        }
+        if (min_content < 1e9) C_init = min_content;
+        else C_init = 0.1;
+
+        TH1D *h_log = (TH1D*)h_dt_michel_filtered->Clone("h_log");
+        for (int i = 1; i <= h_log->GetNbinsX(); i++) {
+            double content = h_log->GetBinContent(i);
+            double error = h_log->GetBinError(i);
+            if (content > C_init && error > 0) {
+                h_log->SetBinContent(i, log(content - C_init));
+                h_log->SetBinError(i, error / (content - C_init));
+            } else {
+                h_log->SetBinContent(i, 0);
+                h_log->SetBinError(i, 0);
+            }
+        }
+        TF1 *linearFit = new TF1("linearFit", "[0] - x/[1]", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+        linearFit->SetParameters(log(N0_init), 2.2);
+        h_log->Fit(linearFit, "Q", "", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+        double tau_init = linearFit->GetParameter(1);
+        delete linearFit;
+        delete h_log;
+
+        TF1 *expFit = new TF1("expFit", ExpFit, FIT_MIN_FILTERED, FIT_MAX_FILTERED, 3);
+        expFit->SetParameters(N0_init, tau_init, C_init);
+        expFit->SetParLimits(0, 0, N0_init * 100);
+        expFit->SetParLimits(1, 0.1, 20.0);
+        expFit->SetParLimits(2, -C_init * 10, C_init * 10);
+        expFit->SetParNames("N_{0}", "#tau", "C");
+        expFit->SetNpx(1000);
+
+        h_dt_michel_filtered->Fit(expFit, "RE", "", FIT_MIN_FILTERED, FIT_MAX_FILTERED);
+        expFit->SetLineColor(kGreen);
+        expFit->SetLineWidth(3);
+        expFit->Draw("same");
+
+        // Create the stats box with fit parameters
+        CreateStatsBox(h_dt_michel_filtered, expFit, "Filtered DeltaT", kRed);
+
+        cout << "Single-Exponential Fit Results (Filtered Michel dt, " << FIT_MIN_FILTERED << "-" << FIT_MAX_FILTERED << " µs):\n";
+        cout << Form("N₀ = %.1f ± %.1f", expFit->GetParameter(0), expFit->GetParError(0)) << endl;
+        cout << Form("τ = %.4f ± %.4f µs", expFit->GetParameter(1), expFit->GetParError(1)) << endl;
+        cout << Form("C = %.1f ± %.1f", expFit->GetParameter(2), expFit->GetParError(2)) << endl;
+        cout << Form("χ²/NDF = %.4f", expFit->GetChisquare() / expFit->GetNDF()) << endl;
+        cout << "----------------------------------------" << endl;
+
+        delete expFit;
+    } else {
+        cout << "Warning: Insufficient entries (" << h_dt_michel_filtered->GetEntries() << ") for filtered exponential fit." << endl;
+        CreateStatsBox(h_dt_michel_filtered, nullptr, "Filtered DeltaT", kRed);
+    }
+
+    c->Update();
+    c->Modified();
+    c->RedrawAxis();
+    plotName = OUTPUT_DIR + "/Michel_dt_filtered.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
@@ -931,6 +1284,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_side_vp_muon->SetLineColor(kMagenta);
     h_side_vp_muon->Draw();
+    CreateStatsBox(h_side_vp_muon, nullptr, "Side Veto Muon", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Side_Veto_Muon.png";
     c->SaveAs(plotName.c_str());
@@ -940,6 +1294,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_top_vp_muon->SetLineColor(kCyan);
     h_top_vp_muon->Draw();
+    CreateStatsBox(h_top_vp_muon, nullptr, "Top Veto Muon", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Top_Veto_Muon.png";
     c->SaveAs(plotName.c_str());
@@ -949,6 +1304,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_trigger_bits->SetLineColor(kGreen);
     h_trigger_bits->Draw();
+    CreateStatsBox(h_trigger_bits, nullptr, "Trigger Bits", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/TriggerBits_Distribution.png";
     c->SaveAs(plotName.c_str());
@@ -958,6 +1314,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_peak_position_rms->SetLineColor(kBlue);
     h_peak_position_rms->Draw();
+    CreateStatsBox(h_peak_position_rms, nullptr, "Peak Position RMS", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Peak_Position_RMS.png";
     c->SaveAs(plotName.c_str());
@@ -967,6 +1324,7 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_good_vs_bad->SetFillColor(kBlue);
     h_good_vs_bad->Draw("BAR");
+    CreateStatsBox(h_good_vs_bad, nullptr, "Event Quality", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Good_vs_Bad_Events.png";
     c->SaveAs(plotName.c_str());
@@ -976,15 +1334,44 @@ int main(int argc, char *argv[]) {
     c->Clear();
     h_saturation->SetFillColor(kOrange);
     h_saturation->Draw("BAR");
+    CreateStatsBox(h_saturation, nullptr, "Saturation Status", kRed);
     c->Update();
     plotName = OUTPUT_DIR + "/Saturation_Status.png";
     c->SaveAs(plotName.c_str());
     cout << "Saved plot: " << plotName << endl;
 
+    // Special Regions Distribution
+    c->Clear();
+    h_special_regions->SetLineColor(kMagenta);
+    h_special_regions->Draw();
+    CreateStatsBox(h_special_regions, nullptr, "Special Regions", kRed);
+    c->Update();
+    plotName = OUTPUT_DIR + "/Special_Regions.png";
+    c->SaveAs(plotName.c_str());
+    cout << "Saved plot: " << plotName << endl;
+
+    // Save histograms to ROOT file
+    TFile *outFile = new TFile((OUTPUT_DIR + "/analysis_output.root").c_str(), "RECREATE");
+    h_muon_energy->Write();
+    h_michel_energy->Write();
+    h_dt_michel->Write();
+    h_dt_michel_filtered->Write();
+    h_energy_vs_dt->Write();
+    h_side_vp_muon->Write();
+    h_top_vp_muon->Write();
+    h_trigger_bits->Write();
+    h_peak_position_rms->Write();
+    h_good_vs_bad->Write();
+    h_saturation->Write();
+    h_special_regions->Write();
+    outFile->Close();
+    delete outFile;
+
     // Clean up
     delete h_muon_energy;
     delete h_michel_energy;
     delete h_dt_michel;
+    delete h_dt_michel_filtered;
     delete h_energy_vs_dt;
     delete h_side_vp_muon;
     delete h_top_vp_muon;
@@ -992,9 +1379,10 @@ int main(int argc, char *argv[]) {
     delete h_peak_position_rms;
     delete h_good_vs_bad;
     delete h_saturation;
+    delete h_special_regions;
     delete c;
 
-    cout << "Analysis complete. Results saved in " << OUTPUT_DIR << "/ (*.png)" << endl;
+    cout << "Analysis complete. Results saved in " << OUTPUT_DIR << "/ (*.png, analysis_output.root)" << endl;
     cout << "Total Events Processed: " << total_events << endl;
     cout << "Total Saturated Events: " << total_saturated_events << endl;
     cout << "Total Good Events: " << total_good_events << endl;
