@@ -40,7 +40,7 @@ const int EV61_THRESHOLD = 1200;
 const double MUON_ENERGY_THRESHOLD = 50;
 const double MICHEL_ENERGY_MIN = 40;
 const double MICHEL_ENERGY_MAX = 1000;
-const double MICHEL_ENERGY_MAX_DT = 500;
+const double MICHEL_ENERGY_MAX_DT = 400;
 const double MICHEL_DT_MIN = 0.8;
 const double MICHEL_DT_MAX = 16.0;
 const int ADCSIZE = 45;
@@ -59,7 +59,7 @@ const int MAX_SAVED_WAVEFORMS = 20;  // Increased from 10 to 20
 
 // Filtering parameters
 const double CHI2_THRESHOLD = 2.0;
-const int MAX_ITERATIONS = 3;
+const int MAX_ITERATIONS = 6;
 
 // Problematic time regions
 const double REGION1_LOW = 4.0;
@@ -298,19 +298,39 @@ bool detectPileup(TH1D* h_wf, pulse_temp& pt, double baselineRMS) {
     
     if (peaks.size() < 2) return false;
     
-    sort(peaks.begin(), peaks.end(), 
+    // Find global maximum peak value
+    double global_max_peak = 0;
+    for (const auto& peak : peaks) {
+        if (peak.second > global_max_peak) {
+            global_max_peak = peak.second;
+        }
+    }
+    
+    // Sort by position (time) instead of amplitude
+    sort(peaks.begin(), peaks.end(),
          [](const pair<int, double>& a, const pair<int, double>& b) {
-             return a.second > b.second;
+             return a.first < b.first;
          });
     
-    int main_peak_pos = peaks[0].first;
-    double main_peak_val = peaks[0].second;
+    // Find the first significant peak as main peak
+    int main_peak_pos = -1;
+    for (const auto& peak : peaks) {
+        if (peak.second > PILEUP_PEAK_RATIO * global_max_peak) {
+            main_peak_pos = peak.first;
+            break;
+        }
+    }
+    if (main_peak_pos == -1) return false;
     
-    for (size_t i = 1; i < peaks.size(); i++) {
-        int current_pos = peaks[i].first;
-        double current_val = peaks[i].second;
+    // Check all other peaks for pileup
+    vector<int> secondary_peaks;
+    for (const auto& peak : peaks) {
+        int current_pos = peak.first;
+        double current_val = peak.second;
         
-        if (current_val > PILEUP_PEAK_RATIO * main_peak_val && 
+        if (current_pos == main_peak_pos) continue;
+        
+        if (current_val > PILEUP_PEAK_RATIO * global_max_peak && 
             abs(current_pos - main_peak_pos) > PILEUP_MIN_SEPARATION) {
             
             double secondary_area = 0;
@@ -322,12 +342,13 @@ bool detectPileup(TH1D* h_wf, pulse_temp& pt, double baselineRMS) {
             }
             
             if (secondary_area > PILEUP_SECONDARY_AREA_RATIO * pt.energy) {
-                pt.secondary_peaks.push_back(current_pos);
+                secondary_peaks.push_back(current_pos);
             }
         }
     }
     
-    pt.is_pileup = !pt.secondary_peaks.empty();
+    pt.secondary_peaks = secondary_peaks;
+    pt.is_pileup = !secondary_peaks.empty();
     return pt.is_pileup;
 }
 
@@ -340,6 +361,33 @@ void plotWaveformWithPileup(TH1D* h_wf, const pulse_temp& pt, const string& outp
     h_wf->GetXaxis()->SetTitle("Sample");
     h_wf->GetYaxis()->SetTitle("ADC Counts");
     h_wf->Draw();
+    
+    // Mark main peak
+    TMarker* main_marker = new TMarker(pt.peak_position, h_wf->GetBinContent(pt.peak_position), 29);
+    main_marker->SetMarkerColor(kRed);
+    main_marker->SetMarkerSize(2);
+    main_marker->Draw();
+    
+    // Mark secondary peaks
+    for (int pos : pt.secondary_peaks) {
+        TMarker* sec_marker = new TMarker(pos, h_wf->GetBinContent(pos), 29);
+        sec_marker->SetMarkerColor(kBlue);
+        sec_marker->SetMarkerSize(2);
+        sec_marker->Draw();
+    }
+    
+    TLatex* tex = new TLatex();
+    tex->SetTextFont(42);
+    tex->SetTextSize(0.035);
+    tex->DrawTextNDC(0.15, 0.85, Form("Event %d, Channel %d", eventID, channel));
+    tex->DrawTextNDC(0.15, 0.80, Form("Main Peak: %d (%.1f ADC)", pt.peak_position, pt.peak));
+    
+    int i = 0;
+    for (int sec_pos : pt.secondary_peaks) {
+        tex->DrawTextNDC(0.15, 0.75 - i*0.05, 
+                        Form("Sec Peak: %d (%.1f ADC)", sec_pos, h_wf->GetBinContent(sec_pos)));
+        i++;
+    }
     
     string plotName = outputDir + "/pileup_waveforms/Event_" + to_string(eventID) + 
                      "_Channel_" + to_string(channel) + ".png";
