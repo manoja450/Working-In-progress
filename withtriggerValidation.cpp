@@ -1205,9 +1205,7 @@ int main(int argc, char *argv[]) {
     stats->AddText(Form("Neither: %d", (int)h_dt_neither->GetEntries()));
     stats->AddText(Form("One sat: %d", (int)h_dt_one_sat->GetEntries()));
     stats->AddText(Form("Both sat: %d", (int)h_dt_both_sat->GetEntries()));
-    stats->AddText(Form("RMS (neither): %.1f ns", h_dt_neither->GetRMS()));
-    stats->AddText(Form("RMS (one sat): %.1f ns", h_dt_one_sat->GetRMS()));
-    stats->AddText(Form("RMS (both): %.1f ns", h_dt_both_sat->GetRMS()));
+    
     stats->Draw();
     
     // Save plot
